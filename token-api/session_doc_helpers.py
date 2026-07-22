@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 # The live Obsidian vaults. Tests MUST NOT write here; the chokepoint guard below
 # hard-fails any session-doc creation that targets either tree while under pytest.
 # Imperium = personal-infra vault; Pax-ENV = civic (day-job / askCivic) vault.
-LIVE_VAULT_ROOT = Path("/Volumes/Imperium/Imperium-ENV")
+LIVE_VAULT_ROOT = Path("~/vaults/Imperium-ENV").expanduser()
+LIVE_LOGS_VAULT_ROOT = Path("~/vaults/Imperium-Logs").expanduser()
 LIVE_CIVIC_VAULT_ROOT = Path("/Volumes/Civic/Pax-ENV")
 
 OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
@@ -47,10 +48,21 @@ def vault_root() -> Path:
     env = os.environ.get("IMPERIUM_ENV")
     if env:
         return Path(env)
-    imperium = Path(os.environ.get("IMPERIUM", "/Volumes/Imperium"))
-    if not imperium.exists():
-        imperium = Path.home()
-    return imperium / "Imperium-ENV"
+    return Path(os.environ.get("IMPERIUM_VAULT", "~/vaults/Imperium-ENV")).expanduser()
+
+
+def logs_vault_root() -> Path:
+    """Resolve the colocated Imperium-Logs vault for generated session output."""
+    env = os.environ.get("IMPERIUM_LOGS_ENV")
+    if env:
+        return Path(env)
+    configured = os.environ.get("IMPERIUM_LOGS_VAULT")
+    if configured:
+        return Path(configured).expanduser()
+    # Test isolation commonly supplies only IMPERIUM_ENV. The invariant is a
+    # sibling ENV/Logs pair, so derive Logs from that explicitly rather than NAS.
+    env_root = vault_root()
+    return env_root.parent / "Imperium-Logs"
 
 
 def civic_vault_root() -> Path:
@@ -83,15 +95,15 @@ def vault_root_for(working_dir: str | None = None, legion: str | None = None) ->
     """
     if classify_work_class(working_dir, legion) == WorkClass.BILLABLE:
         return civic_vault_root()
-    return vault_root()
+    return logs_vault_root()
 
 
 def terra_sessions_dir() -> Path:
-    return vault_root() / "Terra" / "Sessions"
+    return logs_vault_root() / "Terra" / "Sessions"
 
 
 def mars_sessions_dir() -> Path:
-    return vault_root() / "Mars" / "Sessions"
+    return logs_vault_root() / "Mars" / "Sessions"
 
 
 def daily_notes_dir_for(working_dir: str | None = None, legion: str | None = None) -> Path:
@@ -125,7 +137,7 @@ def _assert_not_live_vault(path: Path) -> None:
         resolved = path.resolve()
     except OSError:
         resolved = path
-    for live_root in (LIVE_VAULT_ROOT, LIVE_CIVIC_VAULT_ROOT):
+    for live_root in (LIVE_VAULT_ROOT, LIVE_LOGS_VAULT_ROOT, LIVE_CIVIC_VAULT_ROOT):
         if resolved == live_root or live_root in resolved.parents:
             raise RuntimeError(
                 f"Test attempted to write a session doc into the LIVE vault: {resolved}. "

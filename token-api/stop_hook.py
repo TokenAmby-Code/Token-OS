@@ -576,8 +576,8 @@ def compact_transcript(events, session_id: str) -> str | None:
 def detect_vault(file_path: str) -> str | None:
     """Detect vault name from an absolute file path."""
     for part in Path(file_path).parts:
-        if part.lower().endswith("-env"):
-            return part  # e.g. "Imperium-ENV"
+        if part in {"Imperium-ENV", "Imperium-Logs", "Pax-ENV"}:
+            return part
     return None
 
 
@@ -585,7 +585,7 @@ def vault_rel_path(file_path: str) -> str | None:
     """Get the vault-relative path from an absolute path."""
     parts = Path(file_path).parts
     for i, part in enumerate(parts):
-        if part.lower().endswith("-env"):
+        if part in {"Imperium-ENV", "Imperium-Logs", "Pax-ENV"}:
             return str(Path(*parts[i + 1 :]))
     return None
 
@@ -663,7 +663,7 @@ def write_transcript_file(session_id, events, instance, session_doc, summary):
 
     content = frontmatter + body
 
-    success = obsidian_create("Imperium-ENV", transcript_rel_path, content)
+    success = obsidian_create("Imperium-Logs", transcript_rel_path, content)
     if success:
         print(f"[ok] Created transcript: {transcript_rel_path}", file=sys.stderr)
         return transcript_filename, one_liner
@@ -701,7 +701,10 @@ def append_wikilink_to_daily_note(transcript_filename, tab_name):
     now = datetime.now()
     ts = now.strftime("%H:%M")
     link_path = f"Mars/Logs/Transcripts/{transcript_filename.replace('.md', '')}"
-    wikilink = f"\n- [[{link_path}|{ts} {tab_name}]]\n"
+    # ENV daily notes cannot use a normal wikilink to a separate Logs vault.
+    # Keep a durable textual reference; operators fetch session docs through the
+    # Logs-default session-doc CLI when they need local ENV access.
+    wikilink = f"\n- {ts} {tab_name} transcript: Imperium-Logs/{link_path}\n"
 
     return obsidian_append("Imperium-ENV", daily_note_path, wikilink)
 

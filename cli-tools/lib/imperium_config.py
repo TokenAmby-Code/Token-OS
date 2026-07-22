@@ -64,6 +64,9 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "mini",
         "device_name": "Mac-Mini",
         "token_os_runtime": "~/runtimes/Token-OS/live",
+        "vaults_root": "~/vaults",
+        "vault_root": "~/vaults/Imperium-ENV",
+        "vault_logs_root": "~/vaults/Imperium-Logs",
     },
     "wsl": {
         "nas_imperium": "/mnt/imperium",
@@ -74,6 +77,9 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "wsl",
         "device_name": "TokenPC",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
+        "vaults_root": "/home/token/vaults",
+        "vault_root": "/home/token/vaults/Imperium-ENV",
+        "vault_logs_root": "/home/token/vaults/Imperium-Logs",
     },
     "phone": {
         "nas_imperium": "",
@@ -84,6 +90,9 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "phone",
         "device_name": "Token-S24",
         "token_os_runtime": "",
+        "vaults_root": "",
+        "vault_root": "",
+        "vault_logs_root": "",
     },
     "linux": {
         "nas_imperium": "/mnt/imperium",
@@ -94,6 +103,9 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "",
         "device_name": "",
         "token_os_runtime": "/home/token/runtimes/token-os/live",
+        "vaults_root": "~/vaults",
+        "vault_root": "~/vaults/Imperium-ENV",
+        "vault_logs_root": "~/vaults/Imperium-Logs",
     },
     # K12 personal (GMKtec K12; Imperium domain — replaces the Mac Mini). Runs
     # its OWN local Token-API (per-box registry pre-cutover) and is the long-term
@@ -108,6 +120,9 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "k12-personal",
         "device_name": "K12-Personal",
         "token_os_runtime": "~/runtimes/Token-OS/live",
+        "vaults_root": "~/vaults",
+        "vault_root": "~/vaults/Imperium-ENV",
+        "vault_logs_root": "~/vaults/Imperium-Logs",
     },
     # K12 work (GMKtec K12; Civic/Pax domain — first physical CIVIC_MACHINE).
     # Present in the Imperium registry only to be nameable for routing/enforcement
@@ -122,6 +137,9 @@ _REGISTRY: dict[str, dict[str, str]] = {
         "ssh_alias": "k12-work",
         "device_name": "K12-Work",
         "token_os_runtime": "",
+        "vaults_root": "",
+        "vault_root": "",
+        "vault_logs_root": "",
     },
 }
 
@@ -142,6 +160,26 @@ def cfg(key: str, machine: str | None = None) -> str:
 
 IMPERIUM = os.environ.get("IMPERIUM") or cfg("nas_imperium")
 CIVIC = os.environ.get("CIVIC") or cfg("nas_civic")
+IMPERIUM_VAULTS_ROOT = os.path.expanduser(
+    os.environ.get("IMPERIUM_VAULTS_ROOT") or cfg("vaults_root")
+)
+IMPERIUM_VAULT = os.path.expanduser(os.environ.get("IMPERIUM_VAULT") or cfg("vault_root"))
+IMPERIUM_LOGS_VAULT = os.path.expanduser(
+    os.environ.get("IMPERIUM_LOGS_VAULT") or cfg("vault_logs_root")
+)
+
+
+def imperium_vault_pair_is_valid() -> bool:
+    """True only when the ENV/Logs pair has the required shared local parent."""
+    if not IMPERIUM_VAULTS_ROOT or not IMPERIUM_VAULT or not IMPERIUM_LOGS_VAULT:
+        return False
+    root = os.path.normpath(IMPERIUM_VAULTS_ROOT)
+    return (
+        os.path.dirname(os.path.normpath(IMPERIUM_VAULT)) == root
+        and os.path.dirname(os.path.normpath(IMPERIUM_LOGS_VAULT)) == root
+        and os.path.basename(os.path.normpath(IMPERIUM_VAULT)) == "Imperium-ENV"
+        and os.path.basename(os.path.normpath(IMPERIUM_LOGS_VAULT)) == "Imperium-Logs"
+    )
 
 
 _QUARANTINE_RE = re.compile(r"\.legacy-\d")

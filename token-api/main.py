@@ -210,6 +210,7 @@ from session_doc_helpers import (
     evaluate_rubric,
     explain_unmet,
     human_filename_stem,
+    logs_vault_root,
     mark_rubric_acknowledged,
     mark_rubric_notified,
     read_frontmatter,
@@ -29184,24 +29185,23 @@ async def _find_latest_transcript(instance_id_short: str) -> str | None:
     try:
         result = await asyncio.to_thread(
             subprocess.run,
-            ["obsidian", "vault=Imperium-ENV", "search", f"query=path:{pattern}"],
+            ["obsidian", "vault=Imperium-Logs", "search", f"query=path:{pattern}"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         # Fallback: glob on disk
-        disk_pattern = str(Path.home() / "Imperium-ENV" / pattern)
+        disk_pattern = str(
+            Path(os.environ.get("IMPERIUM_LOGS_VAULT", "~/vaults/Imperium-Logs")).expanduser()
+            / pattern
+        )
         matches = sorted(_glob.glob(disk_pattern), reverse=True)
-        if not matches:
-            # Also check NAS path
-            nas_pattern = f"/Volumes/Imperium/Imperium-ENV/{pattern}"
-            matches = sorted(_glob.glob(nas_pattern), reverse=True)
         if matches:
             # Return vault-relative path
             for m in matches:
                 parts = Path(m).parts
                 for i, p in enumerate(parts):
-                    if p.lower().endswith("-env"):
+                    if p == "Imperium-Logs":
                         return str(Path(*parts[i + 1 :]))
         return None
     except Exception:
@@ -29336,7 +29336,11 @@ def _session_doc_vault_and_path(file_path: str | Path) -> tuple[str, str]:
     vaults, including test roots supplied through IMPERIUM_ENV/CIVIC_ENV.
     """
     raw = Path(file_path)
-    candidates = ((vault_root(), "IMPERIUM_ENV"), (civic_vault_root(), "CIVIC_ENV"))
+    candidates = (
+        (logs_vault_root(), "IMPERIUM_LOGS_ENV"),
+        (vault_root(), "IMPERIUM_ENV"),
+        (civic_vault_root(), "CIVIC_ENV"),
+    )
     for root, env_name in candidates:
         absolute = raw if raw.is_absolute() else root / raw
         try:
