@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from db_connections import connect_agents_db
 from shared import (
     DB_PATH,
+    automatic_imperium_daily_note_writes_disabled,
     get_day_state,
     get_quiet_hours_status,
     is_phone_reachable,
@@ -67,6 +68,11 @@ async def _consumer_phone_reachability(_: dict) -> dict:
 
 
 async def _consumer_custodes_morning_session() -> dict:
+    if automatic_imperium_daily_note_writes_disabled():
+        return {
+            "status": "skipped",
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+        }
     import httpx
 
     try:
@@ -95,6 +101,12 @@ async def _consumer_custodes_doc_rebind() -> dict:
     are rebound; bespoke dockets are left untouched. The ``custodes_*`` telemetry
     names are retained for dashboard/event stability.
     """
+    if automatic_imperium_daily_note_writes_disabled():
+        return {
+            "status": "skipped",
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+        }
+
     from instance_mutation import update_instance
     from session_doc_helpers import resolve_or_create_today_daily_note_session_doc
 
@@ -169,6 +181,12 @@ async def _consumer_daily_note_creation() -> dict:
     NAS preflight: if /Volumes/Imperium is not mounted, returns skipped rather
     than failing loudly, so the rest of the fan-out continues.
     """
+    if automatic_imperium_daily_note_writes_disabled():
+        return {
+            "status": "skipped",
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+        }
+
     from session_doc_helpers import daily_notes_dir, resolve_or_create_today_daily_note_session_doc
 
     if not _nas_is_mounted():
@@ -417,7 +435,10 @@ async def fire_day_start_internal(
             }
         else:
             missed_result = daily_note_item.get("result") or {}
-        if missed_result.get("status") != "ok":
+        if (
+            missed_result.get("status") != "ok"
+            and missed_result.get("reason") != "automatic_imperium_daily_note_writes_disabled"
+        ):
             await _notify_daily_note_missed(missed_result, source=source)
 
     return {

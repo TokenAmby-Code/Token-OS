@@ -2355,6 +2355,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     scheduler.start()
     print("Scheduler started")
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        await log_event(
+            "automatic_imperium_daily_note_writes_disabled",
+            details={
+                "control": shared.AUTOMATIC_IMPERIUM_DAILY_NOTE_WRITES_DISABLE_ENV,
+                "scheduled_timer_reset_preserved": True,
+            },
+        )
+        logger.warning(
+            "Automatic Imperium daily-note writes disabled by %s",
+            shared.AUTOMATIC_IMPERIUM_DAILY_NOTE_WRITES_DISABLE_ENV,
+        )
     try:
         morning_recovery = await recover_missed_morning_session_startup()
         if morning_recovery.get("recovered"):
@@ -14983,6 +14995,13 @@ def _sync_generate_daily_analytics(date_str: str):
     2. Full JSON to Imperium-ENV/Journal/Daily/analytics/ for programmatic access
     Then deletes only the timer_shifts rows that were flushed.
     """
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        logger.info(
+            "Timer daily analytics skipped for %s: automatic Imperium daily-note writes disabled",
+            date_str,
+        )
+        return None
+
     import json
     import sqlite3
     from collections import defaultdict
@@ -15113,6 +15132,15 @@ def _sync_generate_daily_analytics(date_str: str):
 
 async def generate_daily_timer_analytics(date_str: str):
     """Generate and save daily timer analytics (async wrapper)."""
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        result = {
+            "status": "skipped",
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+            "date": date_str,
+        }
+        logger.info("TIMER: Daily analytics skipped for %s: %s", date_str, result["reason"])
+        await log_event("timer_daily_analytics_skipped", details=result)
+        return result
     try:
         result = await asyncio.to_thread(_sync_generate_daily_analytics, date_str)
         if result:
@@ -15376,6 +15404,13 @@ async def _wipe_prior_day_timer_events(cutoff_date: str) -> None:
 
 
 async def _inject_custodes_morning_prompt(source: str) -> dict:
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        result = {
+            "injected": False,
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+        }
+        await log_event("custodes_morning_lifecycle_prompt", details={"source": source, **result})
+        return result
     try:
         from morning_session import inject_morning_lifecycle_prompt
 
@@ -15517,7 +15552,10 @@ async def recover_missed_morning_session_startup() -> dict:
     window_end_hour = MORNING_SESSION_START_HOUR + MORNING_SESSION_WINDOW_HOURS
     in_window = (local_now.hour + local_now.minute / 60 + local_now.second / 3600) < window_end_hour
     if in_window:
-        result = await enter_morning_session_internal(source="startup_recovery", inject_prompt=True)
+        result = await enter_morning_session_internal(
+            source="startup_recovery",
+            inject_prompt=not shared.automatic_imperium_daily_note_writes_disabled(),
+        )
         result["recovered"] = True
         return result
 
@@ -20622,6 +20660,10 @@ async def health_check():
         "tts_global_mode": TTS_GLOBAL_MODE["mode"],
         "in_meeting": DESKTOP_STATE.get("in_meeting", False),
         "git_sha": LAUNCHED_GIT_SHA,
+        "automatic_imperium_daily_note_writes": {
+            "disabled": shared.automatic_imperium_daily_note_writes_disabled(),
+            "control": shared.AUTOMATIC_IMPERIUM_DAILY_NOTE_WRITES_DISABLE_ENV,
+        },
     }
 
 
@@ -25401,14 +25443,22 @@ async def custodes_morning_brief(request: MorningBriefRequest | None = None) -> 
     /compact → morning brief) into its pane to preserve continuity. Otherwise
     fall back to the existing spawn path via run_morning_session().
     """
+    today = request.date if request and request.date else datetime.now().strftime("%Y-%m-%d")
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        result = {
+            "status": "skipped",
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+            "date": today,
+        }
+        await log_event("custodes_morning_brief_skipped", details=result)
+        return result
+
     from morning_session import (
         build_prompt,
         gather_context,
         get_daily_thread_id,
         run_morning_session,
     )
-
-    today = request.date if request and request.date else datetime.now().strftime("%Y-%m-%d")
 
     # Resolve alive Custodes singleton
     async with connect_agents_db(DB_PATH) as db:
@@ -25509,9 +25559,18 @@ async def start_morning_session():
     Gathers context, spawns a Custodes Claude session with daily persistence,
     sends briefing via TTS, and enters a follow-up loop.
     """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        result = {
+            "status": "skipped",
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+            "date": today,
+        }
+        await log_event("morning_session_start_skipped", device_id="phone", details=result)
+        return result
+
     from morning_session import run_morning_session
 
-    today = datetime.now().strftime("%Y-%m-%d")
     state_file = Path(f"/tmp/custodes_morning_sessions/morning_{today}.json")
 
     # Check if already running
