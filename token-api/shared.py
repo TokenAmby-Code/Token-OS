@@ -28,6 +28,24 @@ if TYPE_CHECKING:
     import aiosqlite
 from db_connections import connect_agents_db, connect_agents_db_sync, resolve_telemetry_db_path
 
+AUTOMATIC_IMPERIUM_DAILY_NOTE_WRITES_DISABLE_ENV = (
+    "TOKEN_API_DISABLE_AUTOMATIC_IMPERIUM_DAILY_NOTE_WRITES"
+)
+
+
+def automatic_imperium_daily_note_writes_disabled() -> bool:
+    """Return whether automatic Terra daily-note mutation is disabled.
+
+    The control is opt-in per service host. Once present, only explicit false
+    values enable writers; empty, malformed, and affirmative values all disable
+    them so a damaged production setting cannot fail open.
+    """
+    value = os.environ.get(AUTOMATIC_IMPERIUM_DAILY_NOTE_WRITES_DISABLE_ENV)
+    if value is None:
+        return False
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 logger = logging.getLogger("token_api")
 _LOG_EVENT_WRITE_LOCK = threading.Lock()
 

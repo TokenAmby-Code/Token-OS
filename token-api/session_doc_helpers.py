@@ -24,6 +24,7 @@ import yaml
 from billable import WorkClass, classify_work_class
 from pane_surface import is_placeholder_tab_name
 from personas import resolve_persona
+from shared import automatic_imperium_daily_note_writes_disabled
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,10 @@ LIVE_MAC_LOGS_VAULT_ROOT = Path("~/Documents/Imperium-Logs").expanduser()
 LIVE_CIVIC_VAULT_ROOT = Path("/Volumes/Civic/Pax-ENV")
 
 OBSIDIAN_SYNC_ILLEGAL_FILENAME_CHARS = r'<>:"/\\|?*'
+
+
+class AutomaticImperiumDailyNoteWritesDisabled(RuntimeError):
+    """Raised when a service-controlled path attempts an automatic note write."""
 
 
 def vault_root() -> Path:
@@ -1570,6 +1575,10 @@ async def resolve_or_create_today_daily_note_session_doc(
     """
     date_str = date_str or datetime.now().strftime("%Y-%m-%d")
     is_civic = classify_work_class(working_dir, legion) == WorkClass.BILLABLE
+    if not is_civic and automatic_imperium_daily_note_writes_disabled():
+        raise AutomaticImperiumDailyNoteWritesDisabled(
+            "automatic Imperium daily-note writes are disabled"
+        )
     fp = (daily_notes_dir_for(working_dir, legion) / f"{date_str}.md").resolve()
     existing = await resolve_or_create_session_doc_for_path(db, fp)
     if existing:
@@ -1628,6 +1637,11 @@ async def resolve_session_doc_for_start(
             continue
         persona = await resolve_persona(db, candidate)
         if persona and persona.get("default_session_doc") == "daily_note":
+            if (
+                classify_work_class(working_dir, legion) != WorkClass.BILLABLE
+                and automatic_imperium_daily_note_writes_disabled()
+            ):
+                return None, "automatic_daily_note_writes_disabled"
             # Civic seats (pax/orchestrator, legion=civic) bind the Pax-ENV daily
             # note; Custodes/FG/Admin with a personal cwd stay Imperium. Routing is
             # by work-class, so it survives the koronus→council pane migration.

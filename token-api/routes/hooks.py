@@ -4524,7 +4524,8 @@ async def handle_session_end(payload: dict) -> dict:
         "instance_stopped", instance_id=session_id, device_id=row[1], details={"source": "hook"}
     )
 
-    # Spawn stop_hook.py to generate transcript + wikilink (session doc or daily note fallback)
+    # Spawn stop_hook.py to generate a transcript and, when allowed, link it to
+    # the bound non-daily session document.
     if not is_subagent:
         stop_hook_script = Path(__file__).parent / "stop_hook.py"
         if stop_hook_script.exists():
@@ -4538,7 +4539,8 @@ async def handle_session_end(payload: dict) -> dict:
                         start_new_session=True,
                     )
                 logger.info(
-                    f"Hook: SessionEnd spawned stop_hook for {session_id[:12]}... (doc {session_doc_id or 'none, daily note fallback'})"
+                    f"Hook: SessionEnd spawned stop_hook for {session_id[:12]}... "
+                    f"(doc {session_doc_id or 'none, transcript retained unlinked'})"
                 )
             except Exception as e:
                 logger.warning(f"Hook: SessionEnd failed to spawn stop_hook: {e}")
@@ -5408,7 +5410,10 @@ async def handle_stop(payload: dict) -> dict:
     )
     raw_timer_mode = getattr(_timer_engine, "current_mode", None)
     timer_mode = getattr(raw_timer_mode, "value", raw_timer_mode)
-    morning_timer_active = timer_mode == "morning_session"
+    morning_timer_active = (
+        timer_mode == "morning_session"
+        and not shared.automatic_imperium_daily_note_writes_disabled()
+    )
     is_sync_instance = is_custodes_persona and morning_timer_active and not _seat_is_dead
     is_subagent_instance_quick = bool(instance.get("is_subagent"))
     has_pending_background = _pending_background_tasks.get(session_id, 0) > 0

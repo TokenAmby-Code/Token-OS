@@ -274,6 +274,8 @@ def morning_session_active(today: str | None = None) -> tuple[bool, str]:
     try:
         import shared
 
+        if shared.automatic_imperium_daily_note_writes_disabled():
+            return False, "automatic_imperium_daily_note_writes_disabled"
         engine = getattr(shared, "timer_engine", None)
         mode = getattr(getattr(engine, "current_mode", None), "value", None)
         if mode == "morning_session":
@@ -676,6 +678,9 @@ def _discord_create_thread(channel: str, name: str, bot: str = "custodes") -> st
 
 def create_daily_thread(today: str) -> str | None:
     """Create today's Discord thread in #briefing and store thread_id in daily note."""
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        logger.info("Daily thread creation skipped: automatic Imperium daily-note writes disabled")
+        return None
     thread_name = f"Daily — {today}"
     thread_id = _discord_create_thread("briefing", thread_name)
     if thread_id:
@@ -720,8 +725,14 @@ def create_daily_thread(today: str) -> str | None:
     return thread_id
 
 
-def ensure_daily_notes():
+def ensure_daily_notes() -> dict | None:
     """Create today's daily notes in both vaults via Obsidian CLI."""
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        logger.info("Daily-note creation skipped: automatic Imperium daily-note writes disabled")
+        return {
+            "status": "skipped",
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+        }
     for vault in ["Imperium-ENV", "Pax-ENV"]:
         try:
             result = subprocess.run(
@@ -911,6 +922,11 @@ def inject_morning_lifecycle_prompt(prompt_text: str | None = None) -> dict:
     This is the scheduler path for first-class ``morning_session`` mode. It uses
     tmuxctl's pane marker and assert/send flow; no physical pane id is hardcoded.
     """
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        return {
+            "injected": False,
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+        }
     prompt = prompt_text or MORNING_LIFECYCLE_PROMPT
     try:
         assertion = shared._tmuxctld_post_json(
@@ -951,6 +967,13 @@ def inject_morning_lifecycle_prompt(prompt_text: str | None = None) -> dict:
 def run_morning_session() -> dict:
     """Main morning session launcher."""
     today = datetime.now().strftime("%Y-%m-%d")
+    if shared.automatic_imperium_daily_note_writes_disabled():
+        logger.info("Morning session skipped: automatic Imperium daily-note writes disabled")
+        return {
+            "status": "skipped",
+            "reason": "automatic_imperium_daily_note_writes_disabled",
+            "date": today,
+        }
     state_file = morning_state_file(today)
     state_file.parent.mkdir(parents=True, exist_ok=True)
 

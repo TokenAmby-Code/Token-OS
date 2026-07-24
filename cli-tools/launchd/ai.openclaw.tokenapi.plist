@@ -64,6 +64,8 @@
 		<string>__SET_BY_OPERATOR__</string>
 		<key>TOKEN_API_OPENAI_TTS_INSTRUCTIONS</key>
 		<string>Read briskly and clearly. Use a fast default speaking pace. Do not add theatrical pauses, sighs, breaths, gasps, inhalations, exhalations, or other nonverbal breathing sounds. Deliver the text directly without performative affect.</string>
+		<key>TOKEN_API_DISABLE_AUTOMATIC_IMPERIUM_DAILY_NOTE_WRITES</key>
+		<string>1</string>
 	</dict>
 	<key>KeepAlive</key>
 	<dict>

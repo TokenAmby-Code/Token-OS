@@ -7,8 +7,8 @@ Usage:
     echo '{"session_id": "..."}' | python3 stop_hook.py
 
 Reads ~/.claude/projects/*/<session-id>.jsonl, produces a compacted transcript
-file at Mars/Logs/Transcripts/, and appends a wikilink to the linked session
-doc or daily note. MiniMax never writes directly to curated documents.
+file at Mars/Logs/Transcripts/, and appends a wikilink to a linked non-daily
+session document. MiniMax never writes directly to curated documents.
 """
 
 from __future__ import annotations
@@ -775,22 +775,6 @@ def append_wikilink_to_session_doc(session_doc_file_path, transcript_filename, t
     return obsidian_append(vault, rel_path, wikilink)
 
 
-def append_wikilink_to_daily_note(transcript_filename, tab_name):
-    """Append a single wikilink line to today's daily note."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    daily_note_path = f"Terra/Journal/Daily/{today}.md"
-
-    now = datetime.now()
-    ts = now.strftime("%H:%M")
-    link_path = f"Mars/Logs/Transcripts/{transcript_filename.replace('.md', '')}"
-    # ENV daily notes cannot use a normal wikilink to a separate Logs vault.
-    # Keep a durable textual reference; operators fetch session docs through the
-    # Logs-default session-doc CLI when they need local ENV access.
-    wikilink = f"\n- {ts} {tab_name} transcript: Imperium-Logs/{link_path}\n"
-
-    return obsidian_append("Imperium-ENV", daily_note_path, wikilink)
-
-
 # ---------------------------------------------------------------------------
 # Remote JSONL fetch
 # ---------------------------------------------------------------------------
@@ -1002,21 +986,22 @@ def main():
     # Append wikilink to the right target
     if session_doc:
         file_path = session_doc.get("file_path", "")
-        print(f"[info] Linking transcript to session doc: {file_path}", file=sys.stderr)
-        success = append_wikilink_to_session_doc(
-            file_path, transcript_filename, tab_name, one_liner
+        is_mac_daily_note = LOCAL_DEVICE == "Mac-Mini" and re.search(
+            r"(?:^|/)Terra/Journal/Daily/\d{4}-\d{2}-\d{2}\.md$", file_path
         )
-        if success:
-            print("[ok] Wikilink appended to session doc", file=sys.stderr)
+        if is_mac_daily_note:
+            print("[info] Mac daily-note transcript link skipped", file=sys.stderr)
         else:
-            print("[warn] Failed to append wikilink to session doc", file=sys.stderr)
+            print(f"[info] Linking transcript to session doc: {file_path}", file=sys.stderr)
+            success = append_wikilink_to_session_doc(
+                file_path, transcript_filename, tab_name, one_liner
+            )
+            if success:
+                print("[ok] Wikilink appended to session doc", file=sys.stderr)
+            else:
+                print("[warn] Failed to append wikilink to session doc", file=sys.stderr)
     else:
-        print("[info] No session doc — linking transcript to daily note", file=sys.stderr)
-        success = append_wikilink_to_daily_note(transcript_filename, tab_name)
-        if success:
-            print("[ok] Wikilink appended to daily note", file=sys.stderr)
-        else:
-            print("[warn] Failed to append wikilink to daily note", file=sys.stderr)
+        print("[info] No session doc — transcript retained without note link", file=sys.stderr)
 
 
 if __name__ == "__main__":
